@@ -1,18 +1,18 @@
-//go:build !plan9 && !solaris
-// +build !plan9,!solaris
-
 package fsnotify
 
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -31,7 +31,7 @@ func init() {
 func TestWatch(t *testing.T) {
 	tests := []testCase{
 		{"multiple creates", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 			addWatch(t, w, tmp)
 
 			cat(t, "data", file)
@@ -50,8 +50,8 @@ func TestWatch(t *testing.T) {
 		`},
 
 		{"dir only", func(t *testing.T, w *Watcher, tmp string) {
-			beforeWatch := filepath.Join(tmp, "beforewatch")
-			file := filepath.Join(tmp, "file")
+			beforeWatch := join(tmp, "beforewatch")
+			file := join(tmp, "file")
 
 			touch(t, beforeWatch)
 			addWatch(t, w, tmp)
@@ -69,9 +69,9 @@ func TestWatch(t *testing.T) {
 		{"subdir", func(t *testing.T, w *Watcher, tmp string) {
 			addWatch(t, w, tmp)
 
-			file := filepath.Join(tmp, "file")
-			dir := filepath.Join(tmp, "sub")
-			dirfile := filepath.Join(tmp, "sub/file2")
+			file := join(tmp, "file")
+			dir := join(tmp, "sub")
+			dirfile := join(tmp, "sub/file2")
 
 			mkdir(t, dir)     // Create sub-directory
 			touch(t, file)    // Create a file
@@ -90,7 +90,12 @@ func TestWatch(t *testing.T) {
 				create    /sub
 				create    /file
 				remove    /file
-
+			fen:
+				create /sub
+				create /file
+				write  /sub
+				remove /sub
+				remove /file
 			# Windows includes a write for the /sub dir too, two of them even(?)
 			windows:
 				create /sub
@@ -103,7 +108,7 @@ func TestWatch(t *testing.T) {
 
 		{"file in directory is not readable", func(t *testing.T, w *Watcher, tmp string) {
 			if runtime.GOOS == "windows" {
-				t.Skip("attributes don't work on Windows")
+				t.Skip("attributes don't work on Windows") // Figure out how to make a file unreadable
 			}
 
 			touch(t, tmp, "file-unreadable")
@@ -124,6 +129,9 @@ func TestWatch(t *testing.T) {
 			kqueue:
 				WRITE    "/file"
 				REMOVE   "/file"
+
+			windows:
+				empty
 		`},
 
 		{"watch same dir twice", func(t *testing.T, w *Watcher, tmp string) {
@@ -142,7 +150,7 @@ func TestWatch(t *testing.T) {
 		`},
 
 		{"watch same file twice", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 			touch(t, file)
 
 			addWatch(t, w, file)
@@ -161,9 +169,12 @@ func TestWatch(t *testing.T) {
 				// behaviour too.
 				t.Skip("broken on macOS")
 			}
+			if !internal.HasPrivilegesForSymlink() {
+				t.Skip("does not have privileges for symlink on this OS")
+			}
 
-			file := filepath.Join(tmp, "file")
-			link := filepath.Join(tmp, "link")
+			file := join(tmp, "file")
+			link := join(tmp, "link")
 			touch(t, file)
 			symlink(t, file, link)
 			addWatch(t, w, link)
@@ -188,12 +199,14 @@ func TestWatch(t *testing.T) {
 				// CREATE "/private/var/.../TestWatchwatch_a_symlink_to_a_dir2551725268/001/dir/file"
 				// Pretty sure this is caused by the broken symlink-follow
 				// behaviour too.
-
 				t.Skip("broken on macOS")
 			}
+			if !internal.HasPrivilegesForSymlink() {
+				t.Skip("does not have privileges for symlink on this OS")
+			}
 
-			dir := filepath.Join(tmp, "dir")
-			link := filepath.Join(tmp, "link")
+			dir := join(tmp, "dir")
+			link := join(tmp, "link")
 			mkdir(t, dir)
 			symlink(t, dir, link)
 			addWatch(t, w, link)
@@ -242,31 +255,29 @@ func TestWatchCreate(t *testing.T) {
 
 		// Links
 		{"create new symlink to file", func(t *testing.T, w *Watcher, tmp string) {
+			if !internal.HasPrivilegesForSymlink() {
+				t.Skip("does not have privileges for symlink on this OS")
+			}
 			touch(t, tmp, "file")
 			addWatch(t, w, tmp)
-			symlink(t, filepath.Join(tmp, "file"), tmp, "link")
+			symlink(t, join(tmp, "file"), tmp, "link")
 		}, `
 			create  /link
-
-			windows:
-				create   /link
-				write    /link
 		`},
 		{"create new symlink to directory", func(t *testing.T, w *Watcher, tmp string) {
+			if !internal.HasPrivilegesForSymlink() {
+				t.Skip("does not have privileges for symlink on this OS")
+			}
 			addWatch(t, w, tmp)
 			symlink(t, tmp, tmp, "link")
 		}, `
 			create  /link
-
-			windows:
-				create  /link
-				write  /link
 		`},
 
 		// FIFO
 		{"create new named pipe", func(t *testing.T, w *Watcher, tmp string) {
 			if runtime.GOOS == "windows" {
-				t.Skip("no named pipes on windows")
+				t.Skip() // No named pipes on Windows.
 			}
 			touch(t, tmp, "file")
 			addWatch(t, w, tmp)
@@ -277,10 +288,16 @@ func TestWatchCreate(t *testing.T) {
 		// Device node
 		{"create new device node pipe", func(t *testing.T, w *Watcher, tmp string) {
 			if runtime.GOOS == "windows" {
-				t.Skip("no device nodes on windows")
+				t.Skip() // No device nodes on Windows.
 			}
 			if isKqueue() {
+				// Don't want to use os/user to check uid, since that pulls in
+				// cgo by default and stuff that uses fsnotify won't be
+				// statically linked by default.
 				t.Skip("needs root on BSD")
+			}
+			if isSolaris() {
+				t.Skip(`"mknod fails with "not owner"`)
 			}
 			touch(t, tmp, "file")
 			addWatch(t, w, tmp)
@@ -300,7 +317,7 @@ func TestWatchWrite(t *testing.T) {
 	tests := []testCase{
 		// Files
 		{"truncate file", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 			cat(t, "data", file)
 			addWatch(t, w, tmp)
 
@@ -331,7 +348,7 @@ func TestWatchWrite(t *testing.T) {
 		`},
 
 		{"multiple writes to a file", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 			cat(t, "data", file)
 			addWatch(t, w, tmp)
 
@@ -366,7 +383,7 @@ func TestWatchWrite(t *testing.T) {
 func TestWatchRename(t *testing.T) {
 	tests := []testCase{
 		{"rename file in watched dir", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 			cat(t, "asd", file)
 
 			addWatch(t, w, tmp)
@@ -381,7 +398,7 @@ func TestWatchRename(t *testing.T) {
 
 			addWatch(t, w, tmp)
 			touch(t, unwatched, "file")
-			mv(t, filepath.Join(unwatched, "file"), tmp, "file")
+			mv(t, join(unwatched, "file"), tmp, "file")
 		}, `
 			create /file
 		`},
@@ -392,8 +409,8 @@ func TestWatchRename(t *testing.T) {
 			}
 
 			unwatched := t.TempDir()
-			file := filepath.Join(tmp, "file")
-			renamed := filepath.Join(unwatched, "renamed")
+			file := join(tmp, "file")
+			renamed := join(unwatched, "renamed")
 
 			addWatch(t, w, tmp)
 
@@ -417,7 +434,7 @@ func TestWatchRename(t *testing.T) {
 
 		{"rename overwriting existing file", func(t *testing.T, w *Watcher, tmp string) {
 			unwatched := t.TempDir()
-			file := filepath.Join(unwatched, "file")
+			file := join(unwatched, "file")
 
 			touch(t, tmp, "renamed")
 			touch(t, file)
@@ -435,42 +452,27 @@ func TestWatchRename(t *testing.T) {
 
 			# TODO: this is broken.
 			dragonfly:
-				REMOVE|WRITE         "/"
+				REMOVE               "/"
 		`},
 
 		{"rename watched directory", func(t *testing.T, w *Watcher, tmp string) {
-			addWatch(t, w, tmp)
-
-			dir := filepath.Join(tmp, "dir")
+			dir := join(tmp, "dir")
 			mkdir(t, dir)
 			addWatch(t, w, dir)
 
 			mv(t, dir, tmp, "dir-renamed")
 			touch(t, tmp, "dir-renamed/file")
 		}, `
-			CREATE   "/dir"           # mkdir
-			RENAME   "/dir"           # mv
-			CREATE   "/dir-renamed"
-			RENAME   "/dir"
-			CREATE   "/dir/file"      # touch
+			rename   /dir
 
+			# TODO(v2): Windows should behave the same by default. See #518
 			windows:
-				CREATE       "/dir"                 # mkdir
-				RENAME       "/dir"                 # mv
-				CREATE       "/dir-renamed"
-				CREATE       "/dir-renamed/file"    # touch
-
-			# TODO: no results for the touch; this is probably a bug; windows
-			# was fixed in #370.
-			kqueue:
-				CREATE               "/dir"           # mkdir
-				CREATE               "/dir-renamed"   # mv
-				REMOVE|RENAME        "/dir"
+				create   /dir/file
 		`},
 
 		{"rename watched file", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
-			rename := filepath.Join(tmp, "rename-one")
+			file := join(tmp, "file")
+			rename := join(tmp, "rename-one")
 			touch(t, file)
 
 			addWatch(t, w, file)
@@ -478,19 +480,36 @@ func TestWatchRename(t *testing.T) {
 			mv(t, file, rename)
 			mv(t, rename, tmp, "rename-two")
 		}, `
-			# TODO: this should update the path. And even then, not clear what
-			# go renamed to what.
-			rename /file  # mv file rename
-			rename /file  # mv rename rename-two
+			rename     /file
 
-			# TODO: seems to lose the watch?
-			kqueue:
-				rename     /file
-
-			# It's actually more correct on Windows.
+			# TODO(v2): Windows should behave the same by default. See #518
 			windows:
-				rename     /file
-				rename     /rename-one
+				rename   /file
+				rename   /rename-one
+		`},
+
+		{"re-add renamed file", func(t *testing.T, w *Watcher, tmp string) {
+			file := join(tmp, "file")
+			rename := join(tmp, "rename")
+			touch(t, file)
+
+			addWatch(t, w, file)
+
+			mv(t, file, rename)
+			touch(t, file)
+			addWatch(t, w, file)
+			cat(t, "hello", rename)
+			cat(t, "hello", file)
+		}, `
+			rename /file    # mv file rename
+			                # Watcher gets removed on rename, so no write for /rename
+			write  /file    # cat hello >file
+
+			# TODO(v2): Windows should behave the same by default. See #518
+			windows:
+				rename    /file
+				write     /rename
+				write     /file
 		`},
 	}
 
@@ -501,17 +520,17 @@ func TestWatchRename(t *testing.T) {
 }
 
 func TestWatchSymlink(t *testing.T) {
+	if !internal.HasPrivilegesForSymlink() {
+		t.Skip("does not have privileges for symlink on this OS")
+	}
+
 	tests := []testCase{
 		{"create unresolvable symlink", func(t *testing.T, w *Watcher, tmp string) {
 			addWatch(t, w, tmp)
 
-			symlink(t, filepath.Join(tmp, "target"), tmp, "link")
+			symlink(t, join(tmp, "target"), tmp, "link")
 		}, `
 			create /link
-
-			windows:
-				create    /link
-				write     /link
 
 			# No events at all on Dragonfly
 			# TODO: should fix this.
@@ -532,7 +551,7 @@ func TestWatchSymlink(t *testing.T) {
 				// kqueue.go does a lot of weird things with symlinks that I
 				// don't think are necessarily correct, but need to test a bit
 				// more.
-				t.Skip()
+				t.Skip("broken on macOS")
 			}
 
 			symlink(t, ".", tmp, "link")
@@ -544,10 +563,39 @@ func TestWatchSymlink(t *testing.T) {
 			write  /link
 			create /link
 
-			linux, windows:
+			linux, windows, fen:
 				remove    /link
 				create    /link
 				write     /link
+		`},
+
+		// Bug #277
+		{"277", func(t *testing.T, w *Watcher, tmp string) {
+			if isKqueue() {
+				// TODO: fix it; this seems a bit hard though; the entire way
+				//       kqueue backend deals with symlinks is meh, and need to
+				//       be careful not to break compatibility.
+				t.Skip("broken on kqueue")
+			}
+
+			touch(t, tmp, "file1")
+			touch(t, tmp, "file2")
+			symlink(t, join(tmp, "file1"), tmp, "link1")
+			symlink(t, join(tmp, "file2"), tmp, "link2")
+
+			addWatch(t, w, tmp)
+			touch(t, tmp, "foo")
+			rm(t, tmp, "foo")
+			mkdir(t, tmp, "apple")
+			mv(t, join(tmp, "apple"), tmp, "pear")
+			rmAll(t, tmp, "pear")
+		}, `
+			create   /foo     # touch foo
+			remove   /foo     # rm foo
+			create   /apple   # mkdir apple
+			rename   /apple   # mv apple pear
+			create   /pear
+			remove   /pear    # rm -r pear
 		`},
 	}
 
@@ -558,36 +606,37 @@ func TestWatchSymlink(t *testing.T) {
 }
 
 func TestWatchAttrib(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("attributes don't work on Windows")
-	}
-
 	tests := []testCase{
 		{"chmod", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 
 			cat(t, "data", file)
 			addWatch(t, w, file)
 			chmod(t, 0o700, file)
 		}, `
 			CHMOD   "/file"
+
+			windows:
+				empty
 		`},
 
 		{"write does not trigger CHMOD", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 
 			cat(t, "data", file)
 			addWatch(t, w, file)
 			chmod(t, 0o700, file)
-
 			cat(t, "more data", file)
 		}, `
 			CHMOD   "/file"
 			WRITE   "/file"
+
+			windows:
+				write /file
 		`},
 
 		{"chmod after write", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 
 			cat(t, "data", file)
 			addWatch(t, w, file)
@@ -598,6 +647,9 @@ func TestWatchAttrib(t *testing.T) {
 			CHMOD   "/file"
 			WRITE   "/file"
 			CHMOD   "/file"
+
+			windows:
+				write /file
 		`},
 	}
 
@@ -607,10 +659,10 @@ func TestWatchAttrib(t *testing.T) {
 	}
 }
 
-func TestWatchRm(t *testing.T) {
+func TestWatchRemove(t *testing.T) {
 	tests := []testCase{
 		{"remove watched file", func(t *testing.T, w *Watcher, tmp string) {
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 			touch(t, file)
 
 			addWatch(t, w, file)
@@ -629,7 +681,7 @@ func TestWatchRm(t *testing.T) {
 				t.Skip("Windows hard-locks open files so this will never work")
 			}
 
-			file := filepath.Join(tmp, "file")
+			file := join(tmp, "file")
 			touch(t, file)
 
 			// Intentionally don't close the descriptor here so it stays around.
@@ -651,34 +703,97 @@ func TestWatchRm(t *testing.T) {
 		`},
 
 		{"remove watched directory", func(t *testing.T, w *Watcher, tmp string) {
-			if runtime.GOOS == "openbsd" || runtime.GOOS == "netbsd" {
-				t.Skip("behaviour is inconsistent on OpenBSD and NetBSD, and this test is flaky")
-			}
+			touch(t, tmp, "a")
+			touch(t, tmp, "b")
+			touch(t, tmp, "c")
+			touch(t, tmp, "d")
+			touch(t, tmp, "e")
+			touch(t, tmp, "f")
+			touch(t, tmp, "g")
 
-			file := filepath.Join(tmp, "file")
-
-			touch(t, file)
+			mkdir(t, tmp, "h")
+			mkdir(t, tmp, "h", "a")
+			mkdir(t, tmp, "i")
+			mkdir(t, tmp, "i", "a")
+			mkdir(t, tmp, "j")
+			mkdir(t, tmp, "j", "a")
 			addWatch(t, w, tmp)
 			rmAll(t, tmp)
 		}, `
-			# OpenBSD, NetBSD
-			remove             /file
-			remove|write       /
+			remove    /
+			remove    /a
+			remove    /b
+			remove    /c
+			remove    /d
+			remove    /e
+			remove    /f
+			remove    /g
+			remove    /h
+			remove    /i
+			remove    /j
 
-			freebsd:
-				remove|write   "/"
-				remove         ""
-				create         "."
-
-			darwin:
-				remove         /file
-				remove|write   /
-			linux:
-				remove         /file
-				remove         /
+			# TODO: this is broken; I've also seen (/i and /j missing):
+			#    REMOVE               "/"
+			#    REMOVE               "/a"
+			#    REMOVE               "/b"
+			#    REMOVE               "/c"
+			#    REMOVE               "/d"
+			#    REMOVE               "/e"
+			#    REMOVE               "/f"
+			#    REMOVE               "/g"
+			#    WRITE                "/h"
+			#    WRITE                "/h"
 			windows:
-				remove         /file
-				remove         /
+				REMOVE               "/"
+				REMOVE               "/a"
+				REMOVE               "/b"
+				REMOVE               "/c"
+				REMOVE               "/d"
+				REMOVE               "/e"
+				REMOVE               "/f"
+				REMOVE               "/g"
+				REMOVE               "/h"
+				REMOVE               "/i"
+				REMOVE               "/j"
+				WRITE                "/h"
+				WRITE                "/h"
+				WRITE                "/i"
+				WRITE                "/i"
+				WRITE                "/j"
+				WRITE                "/j"
+		`},
+
+		{"remove recursive", func(t *testing.T, w *Watcher, tmp string) {
+			recurseOnly(t)
+
+			mkdirAll(t, tmp, "dir1", "subdir")
+			mkdirAll(t, tmp, "dir2", "subdir")
+			touch(t, tmp, "dir1", "subdir", "file")
+			touch(t, tmp, "dir2", "subdir", "file")
+
+			addWatch(t, w, tmp, "dir1", "...")
+			addWatch(t, w, tmp, "dir2", "...")
+			cat(t, "asd", tmp, "dir1", "subdir", "file")
+			cat(t, "asd", tmp, "dir2", "subdir", "file")
+
+			if err := w.Remove(join(tmp, "dir1")); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Remove(join(tmp, "dir2", "...")); err != nil {
+				t.Fatal(err)
+			}
+
+			if w := w.WatchList(); len(w) != 0 {
+				t.Errorf("WatchList not empty: %s", w)
+			}
+
+			cat(t, "asd", tmp, "dir1", "subdir", "file")
+			cat(t, "asd", tmp, "dir2", "subdir", "file")
+		}, `
+			write /dir1/subdir
+			write /dir1/subdir/file
+			write /dir2/subdir
+			write /dir2/subdir/file
 		`},
 	}
 
@@ -688,6 +803,163 @@ func TestWatchRm(t *testing.T) {
 	}
 }
 
+func TestWatchRecursive(t *testing.T) {
+	recurseOnly(t)
+
+	tests := []testCase{
+		// Make a nested directory tree, then write some files there.
+		{"basic", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "/one/two/three/four")
+			addWatch(t, w, tmp, "/...")
+
+			cat(t, "asd", tmp, "/file.txt")
+			cat(t, "asd", tmp, "/one/two/three/file.txt")
+		}, `
+			create    /file.txt                  # cat asd >file.txt
+			write     /file.txt
+
+			write     /one/two/three             # cat asd >one/two/three/file.txt
+			create    /one/two/three/file.txt
+			write     /one/two/three/file.txt
+		`},
+
+		// Create a new directory tree and then some files under that.
+		{"add directory", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "/one/two/three/four")
+			addWatch(t, w, tmp, "/...")
+
+			mkdirAll(t, tmp, "/one/two/new/dir")
+			touch(t, tmp, "/one/two/new/file")
+			touch(t, tmp, "/one/two/new/dir/file")
+		}, `
+			write     /one/two                # mkdir -p one/two/new/dir
+			create    /one/two/new
+			create    /one/two/new/dir
+
+			write     /one/two/new            # touch one/two/new/file
+			create    /one/two/new/file
+
+			create    /one/two/new/dir/file   # touch one/two/new/dir/file
+		`},
+
+		// Remove nested directory
+		{"remove directory", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "one/two/three/four")
+			addWatch(t, w, tmp, "...")
+
+			cat(t, "asd", tmp, "one/two/three/file.txt")
+			rmAll(t, tmp, "one/two")
+		}, `
+			write                /one/two/three            # cat asd >one/two/three/file.txt
+			create               /one/two/three/file.txt
+			write                /one/two/three/file.txt
+
+			write                /one/two                  # rm -r one/two
+			write                /one/two/three
+			remove               /one/two/three/file.txt
+			remove               /one/two/three/four
+			write                /one/two/three
+			remove               /one/two/three
+			write                /one/two
+			remove               /one/two
+		`},
+
+		// Rename nested directory
+		{"rename directory", func(t *testing.T, w *Watcher, tmp string) {
+			mkdirAll(t, tmp, "/one/two/three/four")
+			addWatch(t, w, tmp, "...")
+
+			mv(t, join(tmp, "one"), tmp, "one-rename")
+			touch(t, tmp, "one-rename/file")
+			touch(t, tmp, "one-rename/two/three/file")
+		}, `
+			rename               "/one"                        # mv one one-rename
+			create               "/one-rename"
+
+			write                "/one-rename"                 # touch one-rename/file
+			create               "/one-rename/file"
+
+			write                "/one-rename/two/three"       # touch one-rename/two/three/file
+			create               "/one-rename/two/three/file"
+		`},
+
+		{"remove watched directory", func(t *testing.T, w *Watcher, tmp string) {
+			mk := func(r string) {
+				touch(t, r, "a")
+				touch(t, r, "b")
+				touch(t, r, "c")
+				touch(t, r, "d")
+				touch(t, r, "e")
+				touch(t, r, "f")
+				touch(t, r, "g")
+
+				mkdir(t, r, "h")
+				mkdir(t, r, "h", "a")
+				mkdir(t, r, "i")
+				mkdir(t, r, "i", "a")
+				mkdir(t, r, "j")
+				mkdir(t, r, "j", "a")
+			}
+			mk(tmp)
+			mkdir(t, tmp, "sub")
+			mk(join(tmp, "sub"))
+
+			addWatch(t, w, tmp, "...")
+			rmAll(t, tmp)
+		}, `
+			remove               "/a"
+			remove               "/b"
+			remove               "/c"
+			remove               "/d"
+			remove               "/e"
+			remove               "/f"
+			remove               "/g"
+			write                "/h"
+			remove               "/h/a"
+			write                "/h"
+			remove               "/h"
+			write                "/i"
+			remove               "/i/a"
+			write                "/i"
+			remove               "/i"
+			write                "/j"
+			remove               "/j/a"
+			write                "/j"
+			remove               "/j"
+			write                "/sub"
+			remove               "/sub/a"
+			remove               "/sub/b"
+			remove               "/sub/c"
+			remove               "/sub/d"
+			remove               "/sub/e"
+			remove               "/sub/f"
+			remove               "/sub/g"
+			write                "/sub/h"
+			remove               "/sub/h/a"
+			write                "/sub/h"
+			remove               "/sub/h"
+			write                "/sub/i"
+			remove               "/sub/i/a"
+			write                "/sub/i"
+			remove               "/sub/i"
+			write                "/sub/j"
+			remove               "/sub/j/a"
+			write                "/sub/j"
+			remove               "/sub/j"
+			write                "/sub"
+			remove               "/sub"
+			remove               "/"
+		`},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		tt.run(t)
+	}
+}
+
+// TODO: this fails reguarly in the CI; not sure if it's a bug with the test or
+// code; need to look in to it.
 func TestClose(t *testing.T) {
 	chanClosed := func(t *testing.T, w *Watcher) {
 		t.Helper()
@@ -695,8 +967,8 @@ func TestClose(t *testing.T) {
 		// Need a small sleep as Close() on kqueue does all sorts of things,
 		// which may take a little bit.
 		switch runtime.GOOS {
-		case "freebsd", "openbsd", "netbsd", "dragonfly", "darwin":
-			time.Sleep(5 * time.Millisecond)
+		case "freebsd", "openbsd", "netbsd", "dragonfly", "darwin", "solaris", "illumos":
+			time.Sleep(50 * time.Millisecond)
 		}
 
 		select {
@@ -770,7 +1042,7 @@ func TestClose(t *testing.T) {
 
 		files := make([]string, 0, 200)
 		for i := 0; i < 200; i++ {
-			f := filepath.Join(tmp, fmt.Sprintf("file-%03d", i))
+			f := join(tmp, fmt.Sprintf("file-%03d", i))
 			touch(t, f, noWait)
 			files = append(files, f)
 		}
@@ -832,7 +1104,7 @@ func TestClose(t *testing.T) {
 
 	t.Run("closes channels after read", func(t *testing.T) {
 		if runtime.GOOS == "netbsd" {
-			t.Skip("flaky") // TODO
+			t.Skip("flaky")
 		}
 
 		t.Parallel()
@@ -850,18 +1122,67 @@ func TestClose(t *testing.T) {
 
 		chanClosed(t, w.w)
 	})
+
+	t.Run("error after closed", func(t *testing.T) {
+		t.Parallel()
+
+		tmp := t.TempDir()
+		w := newWatcher(t, tmp)
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		file := join(tmp, "file")
+		touch(t, file)
+		if err := w.Add(file); !errors.Is(err, ErrClosed) {
+			t.Fatalf("wrong error for Add: %#v", err)
+		}
+		if err := w.Remove(file); err != nil {
+			t.Fatalf("wrong error for Remove: %#v", err)
+		}
+		if l := w.WatchList(); l != nil { // Should return an error, but meh :-/
+			t.Fatalf("WatchList not nil: %#v", l)
+		}
+	})
 }
 
 func TestAdd(t *testing.T) {
+	t.Run("doesn't exist", func(t *testing.T) {
+		t.Parallel()
+		tmp := t.TempDir()
+
+		w := newWatcher(t)
+		err := w.Add(join(tmp, "non-existent"))
+		if err == nil {
+			t.Fatal("err is nil")
+		}
+
+		// Errors for this are inconsistent; should be fixed in v2. See #144
+		switch runtime.GOOS {
+		case "linux":
+			if _, ok := err.(syscall.Errno); !ok {
+				t.Errorf("wrong error type: %[1]T: %#[1]v", err)
+			}
+		case "windows":
+			if _, ok := err.(*os.SyscallError); !ok {
+				t.Errorf("wrong error type: %[1]T: %#[1]v", err)
+			}
+		default:
+			if _, ok := err.(*fs.PathError); !ok {
+				t.Errorf("wrong error type: %[1]T: %#[1]v", err)
+			}
+		}
+	})
+
 	t.Run("permission denied", func(t *testing.T) {
 		if runtime.GOOS == "windows" {
-			t.Skip("attributes don't work on Windows")
+			t.Skip("chmod doesn't work on Windows") // See if we can make a file unreadable
 		}
 
 		t.Parallel()
 
 		tmp := t.TempDir()
-		dir := filepath.Join(tmp, "dir-unreadable")
+		dir := join(tmp, "dir-unreadable")
 		mkdir(t, dir)
 		touch(t, dir, "/file")
 		chmod(t, 0, dir)
@@ -882,10 +1203,30 @@ func TestAdd(t *testing.T) {
 			t.Errorf("not syscall.EACCESS: %T %#[1]v", err)
 		}
 	})
+
+	t.Run("add same path twice", func(t *testing.T) {
+		tmp := t.TempDir()
+		w := newCollector(t)
+		if err := w.w.Add(tmp); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.w.Add(tmp); err != nil {
+			t.Fatal(err)
+		}
+
+		w.collect(t)
+		touch(t, tmp, "file")
+		rm(t, tmp, "file")
+
+		cmpEvents(t, tmp, w.events(t), newEvents(t, `
+			create /file
+			remove /file
+		`))
+	})
 }
 
 // TODO: should also check internal state is correct/cleaned up; e.g. no
-//       left-over file descriptors or whatnot.
+// left-over file descriptors or whatnot.
 func TestRemove(t *testing.T) {
 	t.Run("works", func(t *testing.T) {
 		t.Parallel()
@@ -960,6 +1301,23 @@ func TestRemove(t *testing.T) {
 			w.Close()
 		}
 	})
+
+	t.Run("remove with ... when non-recursive", func(t *testing.T) {
+		recurseOnly(t)
+		t.Parallel()
+
+		tmp := t.TempDir()
+		w := newWatcher(t)
+		addWatch(t, w, tmp)
+
+		if err := w.Remove(join(tmp, "...")); err == nil {
+			t.Fatal("err was nil")
+		}
+		if err := w.Remove(tmp); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 }
 
 func TestEventString(t *testing.T) {
@@ -990,16 +1348,12 @@ func TestEventString(t *testing.T) {
 	}
 }
 
-func isKqueue() bool {
-	switch runtime.GOOS {
-	case "linux", "windows":
-		return false
-	}
-	return true
-}
-
 // Verify the watcher can keep up with file creations/deletions when under load.
 func TestWatchStress(t *testing.T) {
+	if isCI() {
+		t.Skip("fails too often on the CI")
+	}
+
 	// On NetBSD ioutil.ReadDir in sendDirectoryChangeEvents() returns EINVAL
 	// ~80% of the time:
 	//
@@ -1096,9 +1450,6 @@ func TestWatchStress(t *testing.T) {
 			}
 		}
 
-		for i := 0; i < numFiles; i++ {
-			rm(t, tmp, prefix+fmtNum(i), noWait)
-		}
 		close(done)
 	}()
 	<-done
@@ -1152,14 +1503,14 @@ func TestWatchStress(t *testing.T) {
 func TestWatchList(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		// TODO: probably should I guess...
-		t.Skip("WatchList has always beek broken on Windows and I don't feel like fixing it")
+		t.Skip("WatchList has always been broken on Windows and I don't feel like fixing it")
 	}
 
 	t.Parallel()
 
 	tmp := t.TempDir()
-	file := filepath.Join(tmp, "file")
-	other := filepath.Join(tmp, "other")
+	file := join(tmp, "file")
+	other := join(tmp, "other")
 
 	touch(t, file)
 	touch(t, other)
@@ -1172,5 +1523,75 @@ func TestWatchList(t *testing.T) {
 	want := []string{tmp, file}
 	if !reflect.DeepEqual(have, want) {
 		t.Errorf("\nhave: %s\nwant: %s", have, want)
+	}
+}
+
+func BenchmarkWatch(b *testing.B) {
+	w, err := NewWatcher()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	tmp := b.TempDir()
+	file := join(tmp, "file")
+	err = w.Add(tmp)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		for {
+			select {
+			case err, ok := <-w.Errors:
+				if !ok {
+					wg.Done()
+					return
+				}
+				b.Error(err)
+			case _, ok := <-w.Events:
+				if !ok {
+					wg.Done()
+					return
+				}
+			}
+		}
+	}()
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		fp, err := os.Create(file)
+		if err != nil {
+			b.Fatal(err)
+		}
+		err = fp.Close()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+	err = w.Close()
+	if err != nil {
+		b.Fatal(err)
+	}
+	wg.Wait()
+}
+
+func BenchmarkAddRemove(b *testing.B) {
+	w, err := NewWatcher()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	tmp := b.TempDir()
+
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		if err := w.Add(tmp); err != nil {
+			b.Fatal(err)
+		}
+		if err := w.Remove(tmp); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

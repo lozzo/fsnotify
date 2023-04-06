@@ -64,16 +64,16 @@ func addWatch(t *testing.T, w *Watcher, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("addWatch: path must have at least one element: %s", path)
 	}
-	err := w.Add(filepath.Join(path...))
+	err := w.Add(join(path...))
 	if err != nil {
-		t.Fatalf("addWatch(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("addWatch(%q): %s", join(path...), err)
 	}
 }
 
 const noWait = ""
 
 func shouldWait(path ...string) bool {
-	// Take advantage of the fact that filepath.Join skips empty parameters.
+	// Take advantage of the fact that join skips empty parameters.
 	for _, p := range path {
 		if p == "" {
 			return false
@@ -105,13 +105,17 @@ func createFiles(t *testing.T, dir, prefix string, n int, d time.Duration) int {
 			t.Logf("createFiles: stopped at %s files because it took longer than %s", fmtNum(created), d)
 			return created
 		default:
-			fp, err := os.Create(filepath.Join(dir, prefix+fmtNum(i)))
+			path := join(dir, prefix+fmtNum(i))
+			fp, err := os.Create(path)
 			if err != nil {
 				t.Errorf("create failed for %s: %s", fmtNum(i), err)
 				continue
 			}
 			if err := fp.Close(); err != nil {
 				t.Errorf("close failed for %s: %s", fmtNum(i), err)
+			}
+			if err := os.Remove(path); err != nil {
+				t.Errorf("remove failed for %s: %s", fmtNum(i), err)
 			}
 			if i%10_000 == 0 {
 				t.Logf("createFiles: %s", fmtNum(i))
@@ -128,9 +132,9 @@ func mkdir(t *testing.T, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("mkdir: path must have at least one element: %s", path)
 	}
-	err := os.Mkdir(filepath.Join(path...), 0o0755)
+	err := os.Mkdir(join(path...), 0o0755)
 	if err != nil {
-		t.Fatalf("mkdir(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("mkdir(%q): %s", join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -138,19 +142,19 @@ func mkdir(t *testing.T, path ...string) {
 }
 
 // mkdir -p
-// func mkdirAll(t *testing.T, path ...string) {
-// 	t.Helper()
-// 	if len(path) < 1 {
-// 		t.Fatalf("mkdirAll: path must have at least one element: %s", path)
-// 	}
-// 	err := os.MkdirAll(filepath.Join(path...), 0o0755)
-// 	if err != nil {
-// 		t.Fatalf("mkdirAll(%q): %s", filepath.Join(path...), err)
-// 	}
-// 	if shouldWait(path...) {
-// 		eventSeparator()
-// 	}
-// }
+func mkdirAll(t *testing.T, path ...string) {
+	t.Helper()
+	if len(path) < 1 {
+		t.Fatalf("mkdirAll: path must have at least one element: %s", path)
+	}
+	err := os.MkdirAll(join(path...), 0o0755)
+	if err != nil {
+		t.Fatalf("mkdirAll(%q): %s", join(path...), err)
+	}
+	if shouldWait(path...) {
+		eventSeparator()
+	}
+}
 
 // ln -s
 func symlink(t *testing.T, target string, link ...string) {
@@ -158,9 +162,9 @@ func symlink(t *testing.T, target string, link ...string) {
 	if len(link) < 1 {
 		t.Fatalf("symlink: link must have at least one element: %s", link)
 	}
-	err := os.Symlink(target, filepath.Join(link...))
+	err := os.Symlink(target, join(link...))
 	if err != nil {
-		t.Fatalf("symlink(%q, %q): %s", target, filepath.Join(link...), err)
+		t.Fatalf("symlink(%q, %q): %s", target, join(link...), err)
 	}
 	if shouldWait(link...) {
 		eventSeparator()
@@ -173,9 +177,9 @@ func mkfifo(t *testing.T, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("mkfifo: path must have at least one element: %s", path)
 	}
-	err := internal.Mkfifo(filepath.Join(path...), 0o644)
+	err := internal.Mkfifo(join(path...), 0o644)
 	if err != nil {
-		t.Fatalf("mkfifo(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("mkfifo(%q): %s", join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -188,9 +192,9 @@ func mknod(t *testing.T, dev int, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("mknod: path must have at least one element: %s", path)
 	}
-	err := internal.Mknod(filepath.Join(path...), 0o644, dev)
+	err := internal.Mknod(join(path...), 0o644, dev)
 	if err != nil {
-		t.Fatalf("mknod(%d, %q): %s", dev, filepath.Join(path...), err)
+		t.Fatalf("mknod(%d, %q): %s", dev, join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -205,7 +209,7 @@ func cat(t *testing.T, data string, path ...string) {
 	}
 
 	err := func() error {
-		fp, err := os.OpenFile(filepath.Join(path...), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+		fp, err := os.OpenFile(join(path...), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
 			return err
 		}
@@ -227,7 +231,7 @@ func cat(t *testing.T, data string, path ...string) {
 		return fp.Close()
 	}()
 	if err != nil {
-		t.Fatalf("cat(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("cat(%q): %s", join(path...), err)
 	}
 }
 
@@ -237,13 +241,13 @@ func touch(t *testing.T, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("touch: path must have at least one element: %s", path)
 	}
-	fp, err := os.Create(filepath.Join(path...))
+	fp, err := os.Create(join(path...))
 	if err != nil {
-		t.Fatalf("touch(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("touch(%q): %s", join(path...), err)
 	}
 	err = fp.Close()
 	if err != nil {
-		t.Fatalf("touch(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("touch(%q): %s", join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -257,9 +261,9 @@ func mv(t *testing.T, src string, dst ...string) {
 		t.Fatalf("mv: dst must have at least one element: %s", dst)
 	}
 
-	err := os.Rename(src, filepath.Join(dst...))
+	err := os.Rename(src, join(dst...))
 	if err != nil {
-		t.Fatalf("mv(%q, %q): %s", src, filepath.Join(dst...), err)
+		t.Fatalf("mv(%q, %q): %s", src, join(dst...), err)
 	}
 	if shouldWait(dst...) {
 		eventSeparator()
@@ -272,9 +276,9 @@ func rm(t *testing.T, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("rm: path must have at least one element: %s", path)
 	}
-	err := os.Remove(filepath.Join(path...))
+	err := os.Remove(join(path...))
 	if err != nil {
-		t.Fatalf("rm(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("rm(%q): %s", join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -287,9 +291,9 @@ func rmAll(t *testing.T, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("rmAll: path must have at least one element: %s", path)
 	}
-	err := os.RemoveAll(filepath.Join(path...))
+	err := os.RemoveAll(join(path...))
 	if err != nil {
-		t.Fatalf("rmAll(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("rmAll(%q): %s", join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -302,9 +306,9 @@ func chmod(t *testing.T, mode fs.FileMode, path ...string) {
 	if len(path) < 1 {
 		t.Fatalf("chmod: path must have at least one element: %s", path)
 	}
-	err := os.Chmod(filepath.Join(path...), mode)
+	err := os.Chmod(join(path...), mode)
 	if err != nil {
-		t.Fatalf("chmod(%q): %s", filepath.Join(path...), err)
+		t.Fatalf("chmod(%q): %s", join(path...), err)
 	}
 	if shouldWait(path...) {
 		eventSeparator()
@@ -382,6 +386,7 @@ func (w *eventCollector) collect(t *testing.T) {
 					return
 				}
 				t.Error(e)
+				w.done <- struct{}{}
 				return
 			case e, ok := <-w.w.Events:
 				if !ok {
@@ -428,8 +433,8 @@ func (e Events) copy() Events {
 
 // Create a new Events list from a string; for example:
 //
-//   CREATE        path
-//   CREATE|WRITE  path
+//	CREATE        path
+//	CREATE|WRITE  path
 //
 // Every event is one line, and any whitespace between the event and path are
 // ignored. The path can optionally be surrounded in ". Anything after a "#" is
@@ -437,12 +442,12 @@ func (e Events) copy() Events {
 //
 // Platform-specific tests can be added after GOOS:
 //
-//   # Tested if nothing else matches
-//   CREATE   path
+//	# Tested if nothing else matches
+//	CREATE   path
 //
-//   # Windows-specific test.
-//   windows:
-//     WRITE    path
+//	# Windows-specific test.
+//	windows:
+//	  WRITE    path
 //
 // You can specify multiple platforms with a comma (e.g. "windows, linux:").
 // "kqueue" is a shortcut for all kqueue systems (BSD, macOS).
@@ -521,13 +526,9 @@ func newEvents(t *testing.T, s string) Events {
 		if e, ok := events["kqueue"]; ok {
 			return e
 		}
-	// Fall back to solaris for illumos, and vice versa.
-	case "solaris":
-		if e, ok := events["illumos"]; ok {
-			return e
-		}
-	case "illumos":
-		if e, ok := events["solaris"]; ok {
+	// fen shortcut
+	case "solaris", "illumos":
+		if e, ok := events["fen"]; ok {
 			return e
 		}
 	}
@@ -557,7 +558,34 @@ func indent(s fmt.Stringer) string {
 	return "\t" + strings.ReplaceAll(s.String(), "\n", "\n\t")
 }
 
+var join = filepath.Join
+
 func isCI() bool {
 	_, ok := os.LookupEnv("CI")
 	return ok
+}
+
+func isKqueue() bool {
+	switch runtime.GOOS {
+	case "darwin", "freebsd", "openbsd", "netbsd", "dragonfly":
+		return true
+	}
+	return false
+}
+
+func isSolaris() bool {
+	switch runtime.GOOS {
+	case "illumos", "solaris":
+		return true
+	}
+	return false
+}
+
+func recurseOnly(t *testing.T) {
+	switch runtime.GOOS {
+	case "windows":
+		// Run test.
+	default:
+		t.Skip("recursion not yet supported on " + runtime.GOOS)
+	}
 }
